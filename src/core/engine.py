@@ -176,7 +176,6 @@ class SearchEngine:
 
         results = []
         match_count = 0
-        is_recycle_filter = "回收站" in current_filter
 
         try:
             items_snapshot = list(self.file_index_dict.values())
@@ -184,15 +183,15 @@ class SearchEngine:
             return [], -1
 
         for item in items_snapshot:
-            # 【核心修改】：解包时增加 real_path 兜底
-            name_lower, _, ext, _, _, _, _, is_deleted, real_path = item
+            name_lower, _, ext, _, _, _, _, is_deleted, _ = item
 
-            if current_filter != "所有":
-                if current_filter == "文件夹" and ext != "folder":
-                    continue
-                elif is_recycle_filter and not is_deleted:
-                    continue
-                elif not is_recycle_filter and current_filter != "文件夹" and ext not in allowed_exts:
+            # 【核心修复】根据中立的 category_key 进行过滤
+            if current_filter != "category_all":
+                if current_filter == "category_folder":
+                    if ext != "folder": continue
+                elif current_filter == "category_recycle_bin":
+                    if not is_deleted: continue
+                elif ext not in allowed_exts:
                     continue
 
             if keyword and keyword not in name_lower: continue

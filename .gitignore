@@ -16,3 +16,5 @@ build/
 dist/
 *.spec
 version_info.txt
+
+*.egg-info/

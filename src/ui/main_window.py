@@ -6,34 +6,40 @@ from tkinter import ttk, messagebox
 from typing import Any
 from win32com.shell import shell, shellcon
 
-from config import FILE_CATEGORIES
+# 导入配置和引擎
+from config import FILE_CATEGORIES, UI_DISPLAY_LIMIT, ICON_FILENAME
+from core.engine import SearchEngine
 from core.recycle_bin import RecycleBinManager
-from .tray_icon import TrayManager
 
-# 预引入下一步要写的工具库
+# 导入UI和工具
+from .tray_icon import TrayManager
 from utils.helpers import format_size, get_resource_path
-from config import ICON_FILENAME
 from utils.icons import IconManager
+
+# 【改造】导入国际化和设置模块
+from .locales import get_text, set_language, LANGUAGE_NAMES, current_lang
+from utils.settings import save_settings
 
 
 class MainWindow:
     """应用程序主界面 (View/Controller)"""
 
-    def __init__(self, root: tk.Tk, engine: Any):
+    def __init__(self, root: tk.Tk, engine: SearchEngine, settings: dict):
         self.root = root
         self.engine = engine
+        self.settings = settings  # 【新增】保存设置
 
-        self.root.title("Super Search")
-        self.root.geometry("1000x650")
+        # 【改造】从 settings.json 初始化语言
+        initial_lang = self.settings.get("language", "zh")
+        set_language(initial_lang)
 
         self.sort_col = None
         self.sort_reverse = False
         self._search_timer = None
 
-        # 托盘管理器初始化
-        self.tray_manager = TrayManager(self.root, self.full_quit)
+        self.tray_manager = TrayManager(self, self.root)
 
-        # 注册引擎回调插槽（依赖注入的威力）
+        # 注册引擎回调
         self.engine.on_scan_progress = self.update_scan_progress
         self.engine.on_scan_complete = self.on_scan_complete
         self.engine.on_data_updated = self.refresh_ui
@@ -41,73 +47,116 @@ class MainWindow:
 
         # 初始化图标与UI
         self.icon_manager = IconManager()
-        self._set_window_icon()
-        self.setup_ui()
+        self.setup_ui()  # 先绘制UI，此时无文本
+        self.retranslate_ui()  # 再填充所有文本
         self.setup_context_menu()
         self.bind_events()
 
         # 初始化加载逻辑
-        self.status_label.config(text="正在唤醒缓存...", fg="orange")
+        self.show_status_msg(get_text("waking_cache_status"), "orange")
         self.root.update()
 
         if self.engine.load_cache():
             total = len(self.engine.file_index_dict)
-            self.status_label.config(text=f"秒开完成！已加载 {total} 个历史项目", fg="green")
+            self.show_status_msg(get_text("instant_finish_status", total=total), "green")
             self.trigger_search()
         else:
             self.engine.start_fast_indexing()
 
-    def _set_window_icon(self):
-        try:
-            self.root.iconbitmap(get_resource_path(ICON_FILENAME))
-        except Exception:
-            pass
-
     def setup_ui(self):
-        """纯粹的 UI 绘制代码"""
+        """初始化UI布局（无文本）"""
+        self._set_window_icon()
+        self.root.geometry("1000x650")
+
         top_frame = tk.Frame(self.root, pady=10, padx=10)
         top_frame.pack(fill=tk.X)
 
-        tk.Label(top_frame, text="搜索文件名:").pack(side=tk.LEFT)
+        self.search_label = tk.Label(top_frame)
+        self.search_label.pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
         self.search_entry = tk.Entry(top_frame, textvariable=self.search_var, width=40)
         self.search_entry.pack(side=tk.LEFT, padx=10)
 
-        tk.Label(top_frame, text="  筛选:").pack(side=tk.LEFT)
-        self.filter_var = tk.StringVar(value="所有")
-        self.filter_combo = ttk.Combobox(
-            top_frame, textvariable=self.filter_var,
-            values=list(FILE_CATEGORIES.keys()), state="readonly", width=12
-        )
-        self.filter_combo.pack(side=tk.LEFT, padx=5)
+        self.filter_label = tk.Label(top_frame)
+        self.filter_label.pack(side=tk.LEFT, padx=(20, 5))
+        self.filter_var = tk.StringVar()
+        self.filter_combo = ttk.Combobox(top_frame, textvariable=self.filter_var, state="readonly", width=12)
+        self.filter_combo.pack(side=tk.LEFT)
 
-        self.status_label = tk.Label(top_frame, text="准备就绪", fg="blue")
+        # 【改造】语言切换下拉框
+        self.lang_label = tk.Label(top_frame)
+        self.lang_label.pack(side=tk.LEFT, padx=(20, 5))
+        self.lang_var = tk.StringVar()
+        self.lang_combo = ttk.Combobox(top_frame, textvariable=self.lang_var, state="readonly", width=12)
+        self.lang_combo.pack(side=tk.LEFT)
+
+        self.status_label = tk.Label(top_frame, fg="blue")
         self.status_label.pack(side=tk.RIGHT)
 
         mid_frame = tk.Frame(self.root, padx=10, pady=5)
         mid_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 【核心修改】：新增 real_path 列，但保证 displaycolumns 不包含它，实现隐藏存储
         columns = ("filename", "filepath", "size", "mtime", "is_deleted", "real_path")
         self.tree = ttk.Treeview(mid_frame, columns=columns, show="tree headings",
                                  displaycolumns=("filename", "filepath", "size", "mtime"))
-
-        self.tree.column("#0", width=40, stretch=False, anchor=tk.CENTER)
-        self.tree.heading("#0", text="图标")
-
-        for col, text, width, anchor in [
-            ("filename", "名称", 250, tk.W),
-            ("filepath", "路径", 400, tk.W),
-            ("size", "大小", 80, tk.E),
-            ("mtime", "修改时间", 120, tk.W)
-        ]:
-            self.tree.heading(col, text=text, anchor=anchor, command=lambda c=col: self.sort_treeview(c))
-            self.tree.column(col, width=width, stretch=(col == "filepath"), anchor=anchor)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(mid_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def retranslate_ui(self):
+        """【核心改造】应用当前语言的文本，并保持下拉框选择"""
+        # 1. 在更新前，记录当前两个下拉框的选中项索引
+        current_filter_index = self.filter_combo.current()
+        current_lang_index = self.lang_combo.current()
+
+        # 2. 更新所有静态文本
+        self.root.title(get_text("title"))
+        self.search_label.config(text=get_text("search_label"))
+        self.filter_label.config(text=get_text("filter_label"))
+        self.lang_label.config(text=get_text("language_label"))
+        self.status_label.config(text=get_text("ready_status"))
+
+        # 3. 更新筛选器下拉框 (Filter Combobox)
+        #    从 config 中获取中立的 key，然后用 get_text 翻译它们
+        translated_categories = [get_text(k) for k in FILE_CATEGORIES.keys()]
+        self.filter_combo["values"] = translated_categories
+        if current_filter_index != -1:
+            self.filter_combo.current(current_filter_index)
+        else: # 程序首次加载时，默认为第一个选项
+            self.filter_combo.current(0)
+
+        # 4. 更新语言下拉框 (Language Combobox)
+        self.lang_combo["values"] = list(LANGUAGE_NAMES.values())
+        # 如果已有选择，则保持；否则根据当前语言代码设置
+        if current_lang_index != -1:
+            self.lang_combo.current(current_lang_index)
+        else:
+            lang_index = list(LANGUAGE_NAMES.keys()).index(current_lang)
+            self.lang_combo.current(lang_index)
+
+        # 5. 更新列表表头
+        self.tree.column("#0", width=40, stretch=False, anchor=tk.CENTER)
+        self.tree.heading("#0", text=get_text("tree_col_icon"))
+        self._update_heading_arrows()  # 更新表头文本和排序箭头
+
+    def switch_language(self, event=None):
+        """【核心改造】切换语言，保存设置，并刷新整个UI"""
+        selected_lang_name = self.lang_var.get()
+        # 反向查找语言代码 (e.g., "简体中文" -> "zh")
+        lang_code = next((code for code, name in LANGUAGE_NAMES.items() if name == selected_lang_name), None)
+
+        if lang_code and lang_code != self.settings.get("language"):
+            # 更新全局语言状态
+            set_language(lang_code)
+            # 更新并保存设置
+            self.settings["language"] = lang_code
+            save_settings(self.settings)
+            # 重新翻译整个UI
+            self.retranslate_ui()
+            # 触发一次搜索，以刷新可能包含语言文本的状态栏消息
+            self.trigger_search()
 
     def setup_context_menu(self):
         self.context_menu = tk.Menu(self.root, tearoff=0)
@@ -115,21 +164,27 @@ class MainWindow:
     def bind_events(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.search_var.trace_add("write", lambda *args: self.trigger_search())
-        self.filter_combo.bind("<<ComboboxSelected>>", lambda e: self.trigger_search())
+        self.filter_combo.bind("<<ComboboxSelected>>", self.trigger_search)
+        self.lang_combo.bind("<<ComboboxSelected>>", self.switch_language)
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Button-3>", self.show_context_menu)
 
-    # --- 引擎回调更新界面 ---
+    def _set_window_icon(self):
+        """【修复】确保使用正确的图标文件名常量"""
+        # 确保你已经从 utils.helpers 导入了 get_resource_path
+        icon_path = get_resource_path("assets/app_icon.ico")
+        try:
+            self.root.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"图标加载失败: {e}")
+
     def update_scan_progress(self, count: int, current_dir: str):
-        # 必须用 self.root.after 确保在主线程更新 UI
-        self.root.after(0, lambda: self.status_label.config(
-            text=f"扫描中 ({count} 项) ... 当前: {current_dir[:30]}", fg="red"
-        ))
+        msg = get_text("scan_progress_status", count=count, current_dir=current_dir)
+        self.root.after(0, lambda: self.show_status_msg(msg, "red"))
 
     def on_scan_complete(self, total_count: int):
-        self.root.after(0, lambda: self.status_label.config(
-            text=f"加载完成！共 {total_count} 个项目", fg="green"
-        ))
+        msg = get_text("scan_complete_status", total_count=total_count)
+        self.root.after(0, lambda: self.show_status_msg(msg, "green"))
         self.root.after(0, self.trigger_search)
 
     def show_status_msg(self, msg: str, color: str):
@@ -138,35 +193,35 @@ class MainWindow:
     def refresh_ui(self):
         self.root.after(0, self.trigger_search)
 
-    # --- 搜索与渲染逻辑 ---
-    def trigger_search(self):
-        """UI防抖控制"""
+    def trigger_search(self, event=None):
         if self._search_timer:
             self.root.after_cancel(self._search_timer)
-        self._search_timer = self.root.after(300, self._do_search)
+        self._search_timer = self.root.after(250, self._do_search)
 
     def _do_search(self):
         keyword = self.search_var.get()
-        current_filter = self.filter_var.get()
 
-        # 调用核心大脑获取数据
-        results, match_count = self.engine.perform_search(keyword, current_filter, self.sort_col, self.sort_reverse)
+        # 【核心改造】通过索引获取中立的 category key，而不是通过翻译后的字符串
+        selected_filter_index = self.filter_combo.current()
+        if selected_filter_index == -1: # 如果没有选中项，默认为 'all'
+            selected_filter_index = 0
+        category_key = list(FILE_CATEGORIES.keys())[selected_filter_index]
+
+        results, match_count = self.engine.perform_search(keyword, category_key, self.sort_col, self.sort_reverse)
 
         if match_count == -1:
-            # 引擎正在后台写数据被锁，延迟重试
             self.root.after(50, self._do_search)
             return
 
         self.render_treeview(results)
         self._update_heading_arrows()
 
-        # 状态栏文字更新
-        if not keyword and current_filter == "所有":
+        if not keyword and category_key == "category_all":
             total = len(self.engine.file_index_dict)
-            self.status_label.config(text=f"秒开完成！共 {total} 个项目", fg="green")
+            self.show_status_msg(get_text("instant_finish_status", total=total), "green")
         else:
-            limit_tip = " (列表仅展示前1000项)" if match_count > 1000 else ""
-            self.status_label.config(text=f"找到 {match_count} 个对象{limit_tip}", fg="green")
+            limit_tip = f" (Top {UI_DISPLAY_LIMIT})" if match_count > UI_DISPLAY_LIMIT else ""
+            self.show_status_msg(get_text("found_objects_status", match_count=match_count, limit_tip=limit_tip), "green")
 
     def render_treeview(self, results):
         self.tree.delete(*self.tree.get_children())
@@ -177,9 +232,8 @@ class MainWindow:
             try:
                 display_time = datetime.datetime.fromtimestamp(mtime).strftime('%Y/%m/%d %H:%M')
             except:
-                display_time = "未知"
+                display_time = get_text("unknown_time")
 
-            # 【核心修改】：将 real_path 一同存入 values 中
             self.tree.insert("", tk.END, text="", image=icon,
                              values=(orig_name, path, display_size, display_time, is_deleted, real_path))
 
@@ -192,12 +246,24 @@ class MainWindow:
         self.trigger_search()
 
     def _update_heading_arrows(self):
-        headings = {"filename": "名称", "filepath": "路径", "size": "大小", "mtime": "修改时间"}
-        for col, text in headings.items():
-            arrow = " ▼" if self.sort_reverse else " ▲" if col == self.sort_col else ""
-            self.tree.heading(col, text=text + arrow)
+        headings = {
+            "filename": "tree_col_name",
+            "filepath": "tree_col_path",
+            "size": "tree_col_size",
+            "mtime": "tree_col_mtime"
+        }
+        for col, text_key in headings.items():
+            # 先获取翻译后的文本
+            translated_text = get_text(text_key)
+            # 再添加排序箭头
+            arrow = " ▼" if self.sort_reverse and self.sort_col == col else " ▲" if self.sort_col == col else ""
+            self.tree.heading(col, text=translated_text + arrow, command=lambda c=col: self.sort_treeview(c))
+            # 为 TreeView 列设置固定的宽度和对齐方式
+            if text_key == "tree_col_name": self.tree.column(col, width=250, anchor=tk.W)
+            elif text_key == "tree_col_path": self.tree.column(col, width=400, stretch=True, anchor=tk.W)
+            elif text_key == "tree_col_size": self.tree.column(col, width=80, anchor=tk.E)
+            elif text_key == "tree_col_mtime": self.tree.column(col, width=120, anchor=tk.W)
 
-    # --- 右键菜单与业务动作 ---
     def show_context_menu(self, event):
         iid = self.tree.identify_row(event.y)
         if not iid: return
@@ -208,25 +274,23 @@ class MainWindow:
             selected_items = [iid]
 
         is_deleted = (str(self.tree.item(iid, "values")[4]) == 'True')
+        count = len(selected_items)
         self.context_menu.delete(0, tk.END)
 
         if is_deleted:
-            self.context_menu.add_command(label=f"♻️ 还原选中的 {len(selected_items)} 个文件",
-                                          command=self.action_restore)
-            if len(selected_items) == 1:
-                self.context_menu.add_command(label="📂 还原并打开此文件", command=self.action_restore_and_open)
+            self.context_menu.add_command(label=get_text("restore_action", count=count), command=self.action_restore)
+            if count == 1:
+                self.context_menu.add_command(label=get_text("restore_and_open_action"), command=self.action_restore_and_open)
             self.context_menu.add_separator()
-            self.context_menu.add_command(label=f"❌ 彻底删除选定的 {len(selected_items)} 个项目",
-                                          command=self.action_permanently_delete)
-            self.context_menu.add_command(label="🗑️ 清空整个回收站", command=self.action_empty_recycle_bin)
+            self.context_menu.add_command(label=get_text("permanently_delete_action", count=count), command=self.action_permanently_delete)
+            self.context_menu.add_command(label=get_text("empty_recycle_bin_action"), command=self.action_empty_recycle_bin)
         else:
-            if len(selected_items) == 1:
-                self.context_menu.add_command(label="打开 (文件/文件夹)", command=self.action_open_file)
-                self.context_menu.add_command(label="打开所在位置 (并选中)", command=self.action_open_folder)
-                self.context_menu.add_command(label="📋 复制文件路径", command=self.action_copy_path)
+            if count == 1:
+                self.context_menu.add_command(label=get_text("open_file_action"), command=self.action_open_file)
+                self.context_menu.add_command(label=get_text("open_folder_action"), command=self.action_open_folder)
+                self.context_menu.add_command(label=get_text("copy_path_action"), command=self.action_copy_path)
             self.context_menu.add_separator()
-            self.context_menu.add_command(label=f"🗑️ 移动到回收站 ({len(selected_items)} 项)",
-                                          command=self.action_move_to_recycle_bin)
+            self.context_menu.add_command(label=get_text("move_to_recycle_bin_action", count=count), command=self.action_move_to_recycle_bin)
 
         self.context_menu.tk_popup(event.x_root, event.y_root)
 
@@ -239,23 +303,16 @@ class MainWindow:
         else:
             self.action_open_file()
 
-    # --- 具体交互实现 ---
-    def get_selected_paths(self):
-        return [self.tree.item(item, "values")[1] for item in self.tree.selection()]
-
     def get_selected_items_data(self):
-        """【新增组件】统一获取选中项的双重信息：[(显示路径, 真实底物理径), ...]"""
-        # values[1] 是原路径，values[5] 是隐形的底层真实路径
-        return [(self.tree.item(item, "values")[1], self.tree.item(item, "values")[5]) for item in
-                self.tree.selection()]
+        return [(self.tree.item(item, "values")[1], self.tree.item(item, "values")[5]) for item in self.tree.selection()]
 
     def action_copy_path(self):
         data = self.get_selected_items_data()
-        paths = "\n".join(d[0] for d in data)  # 复制给用户看的显示路径
+        paths = "\n".join(d[0] for d in data)
         self.root.clipboard_clear()
         self.root.clipboard_append(paths)
         self.root.update()
-        self.status_label.config(text=f"已复制路径", fg="green")
+        self.show_status_msg(get_text("path_copied_status"), "green")
 
     def action_open_file(self):
         data = self.get_selected_items_data()
@@ -276,19 +333,20 @@ class MainWindow:
     def action_move_to_recycle_bin(self):
         data = self.get_selected_items_data()
         real_paths = [d[1] for d in data]
-        if not messagebox.askyesno("移至回收站", f"确定要把这 {len(real_paths)} 个项目移到回收站吗？"): return
+        if not messagebox.askyesno(get_text("move_to_recycle_bin_confirm", count=len(real_paths))):
+            return
 
         success_count = 0
         try:
+            flags = shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION | shellcon.FOF_SILENT | shellcon.FOF_NOERRORUI
             for path in real_paths:
                 if os.path.exists(path):
-                    flags = shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION | shellcon.FOF_SILENT | shellcon.FOF_NOERRORUI
                     res, aborted = shell.SHFileOperation((0, shellcon.FO_DELETE, path, None, flags, None, None))
                     if res == 0 and not aborted:
                         success_count += 1
                         self.engine.file_index_dict.pop(path.lower(), None)
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            messagebox.showerror(get_text("error_title"), str(e))
 
         if success_count > 0:
             self.engine.trigger_recycle_bin_refresh()
@@ -296,8 +354,8 @@ class MainWindow:
 
     def action_restore(self) -> bool:
         data = self.get_selected_items_data()
-        real_paths = [d[1] for d in data]  # 给底层用来精准还原
-        display_paths = [d[0] for d in data]  # 给引擎用来更新显示
+        real_paths = [d[1] for d in data]
+        display_paths = [d[0] for d in data]
 
         if RecycleBinManager.restore_files(real_paths):
             for p in display_paths:
@@ -319,7 +377,9 @@ class MainWindow:
     def action_permanently_delete(self):
         data = self.get_selected_items_data()
         real_paths = [d[1] for d in data]
-        if not messagebox.askyesno("警告", f"【危险操作】\n确定要彻底粉碎这 {len(real_paths)} 个文件吗？"): return
+        warn_msg = get_text("permanently_delete_warning", count=len(real_paths))
+        if not messagebox.askyesno(get_text("error_title"), warn_msg):
+            return
 
         if RecycleBinManager.permanently_delete(real_paths):
             for p in real_paths:
@@ -327,7 +387,8 @@ class MainWindow:
             self.trigger_search()
 
     def action_empty_recycle_bin(self):
-        if not messagebox.askyesno("清空回收站", "【毁灭级操作】\n确定要清空回收站里的所有文件吗？"): return
+        if not messagebox.askyesno(get_text("error_title"), get_text("empty_recycle_bin_warning")):
+            return
 
         try:
             RecycleBinManager.empty_bin()
@@ -335,20 +396,23 @@ class MainWindow:
             for k in keys_to_delete:
                 del self.engine.file_index_dict[k]
             self.trigger_search()
-            messagebox.showinfo("完成", "系统回收站已彻底清空！")
+            messagebox.showinfo(get_text("title"), get_text("empty_recycle_bin_success"))
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            messagebox.showerror(get_text("error_title"), str(e))
 
-    # --- 退出控制 ---
     def on_closing(self):
-        response = messagebox.askyesnocancel("退出提示", "点击【是】直接退出\n点击【否】最小化到系统托盘\n点击【取消】返回")
+        response = messagebox.askyesnocancel(
+            get_text("exit_prompt_title"),
+            get_text("exit_prompt_message")
+        )
         if response is True:
             self.full_quit()
         elif response is False:
             self.tray_manager.hide_to_tray()
 
     def full_quit(self):
-        self.status_label.config(text="正在保存快照，请稍候...", fg="red")
+        self.show_status_msg(get_text("saving_snapshot_status"), "red")
         self.root.update()
         self.engine.save_cache()
+        self.tray_manager.stop()
         self.root.destroy()

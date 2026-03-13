@@ -11,6 +11,7 @@ from config import APP_ID, setup_logging
 from core.engine import SearchEngine
 from core.watcher import FileWatcher
 from ui.main_window import MainWindow
+from utils.settings import load_settings  # 【新增】导入设置管理器
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +68,16 @@ def main() -> None:
     logger.info("Starting Super Search initialization with Admin privileges...")
     set_windows_app_id()
 
+    # 【新增】加载用户设置
+    settings = load_settings()
+
     root = tk.Tk()
 
     logger.info("Initializing core search engine...")
     engine = SearchEngine()
 
-    app_window = MainWindow(root, engine)
+    # 【改造】将 settings 传入主窗口
+    app_window = MainWindow(root, engine, settings)
 
     logger.info("Starting background file watcher...")
     watcher = FileWatcher(engine)
